@@ -2,3 +2,30 @@ node_modules/
 .next/
 .env.local
 .env*.local
+
+.DS_Store
+
+# Local OpenClaw/runtime state
+.openclaw/
+memory/
+state/
+AGENTS.md
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+
+# Python caches and virtualenvs
+__pycache__/
+*.pyc
+.venv/
+backend/.venv/
+
+# Local secrets and generated context
+backend/.env
+backend/.nia_sources.json
+
+# Local databases and scratch state
+*.db
+backend/*.db
