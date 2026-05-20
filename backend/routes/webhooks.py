@@ -7,7 +7,13 @@ from fastapi import APIRouter, BackgroundTasks
 
 from db import SessionLocal
 from models import Attendee, Match
-from services.agent_reasoning import compose_human_intro, compose_response, evaluate_proposal
+from services.agent_reasoning import (
+    compose_followup,
+    compose_human_intro,
+    compose_response,
+    evaluate_followup,
+    evaluate_proposal,
+)
 from services.agentmail_service import get_message, send_email
 from services.matching import append_conversation_entry, build_synergy_data, get_proposer_and_receiver, make_preview
 from utils.email_format import format_agent_email, parse_agent_email
@@ -15,6 +21,8 @@ from utils.email_format import format_agent_email, parse_agent_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+MAX_NEGOTIATION_ROUNDS = 2
 
 
 def _first_email(value) -> str:
@@ -155,6 +163,21 @@ def _has_purpose(match: Match, purpose: str) -> bool:
     return False
 
 
+def _count_purpose(match: Match, purpose: str) -> int:
+    try:
+        conversation = match.agent_conversation or "[]"
+        items = json.loads(conversation)
+    except Exception:
+        return 0
+
+    count = 0
+    for item in items if isinstance(items, list) else []:
+        meta = item.get("meta", {}) if isinstance(item, dict) else {}
+        if str(meta.get("purpose", "")).strip() == purpose:
+            count += 1
+    return count
+
+
 def _process_match_proposal(
     db,
     *,
@@ -189,19 +212,92 @@ def _process_match_proposal(
         db.commit()
         return
 
-    if _has_purpose(match, "match_response"):
-        logger.info("Match %s already has a response recorded; skipping duplicate proposal processing.", match.id)
+    synergy_data = build_synergy_data(match)
+    evaluation = evaluate_proposal(recipient, sender, plain_body, synergy_data)
+    response_body = compose_response(
+        match,
+        evaluation["decision"],
+        evaluation["reason"],
+        sender,
+        recipient,
+        questions=evaluation.get("questions") or [],
+    )
+    response_meta = {
+        "match_id": match.id,
+        "purpose": "match_response",
+        "decision": evaluation["decision"],
+        "reason": evaluation["reason"],
+        "questions": json.dumps(evaluation.get("questions") or []),
+    }
+    response_subject, response_full_body = format_agent_email(response_meta, response_body)
+    response_message_id = send_email(
+        from_inbox_id=recipient.inbox_id,
+        to_email=sender.agent_email,
+        subject=response_subject,
+        body=response_full_body,
+        in_reply_to=message_id,
+    )
+    append_conversation_entry(
+        match,
+        _outgoing_entry(
+            from_email=recipient.agent_email,
+            to_email=sender.agent_email,
+            from_name=f"{recipient.name}'s agent",
+            to_name=f"{sender.name}'s agent",
+            body=response_full_body,
+            subject=response_subject,
+            timestamp=datetime.utcnow().isoformat(),
+            meta=response_meta,
+            message_id=response_message_id,
+            thread_id=thread_id,
+        ),
+    )
+    db.commit()
+
+
+def _process_match_followup(
+    db,
+    *,
+    match: Match,
+    sender: Attendee,
+    recipient: Attendee,
+    subject: str,
+    raw_body: str,
+    plain_body: str,
+    meta: dict,
+    message_id: str,
+    thread_id: str,
+    timestamp: str,
+) -> None:
+    appended = append_conversation_entry(
+        match,
+        _incoming_entry(
+            sender=sender,
+            recipient=recipient,
+            body=raw_body,
+            subject=subject,
+            timestamp=timestamp,
+            meta=meta,
+            message_id=message_id,
+            thread_id=thread_id,
+        ),
+    )
+    if not appended:
+        logger.info("Followup webhook message already recorded for match %s; continuing idempotent processing.", match.id)
+
+    if match.status in {"confirmed", "rejected", "met"}:
         db.commit()
         return
 
     synergy_data = build_synergy_data(match)
-    evaluation = evaluate_proposal(recipient, sender, plain_body, synergy_data)
+    evaluation = evaluate_followup(recipient, sender, plain_body, synergy_data)
     response_body = compose_response(match, evaluation["decision"], evaluation["reason"], sender, recipient)
     response_meta = {
         "match_id": match.id,
         "purpose": "match_response",
         "decision": evaluation["decision"],
         "reason": evaluation["reason"],
+        "questions": "[]",
     }
     response_subject, response_full_body = format_agent_email(response_meta, response_body)
     response_message_id = send_email(
@@ -265,7 +361,7 @@ def _process_match_response(
         return
 
     decision = str(meta.get("decision", "")).strip().lower()
-    if decision not in {"approve", "reject"}:
+    if decision not in {"approve", "reject", "negotiate"}:
         logger.warning("Invalid match response decision for match %s: %s", match.id, meta.get("decision"))
         db.commit()
         return
@@ -298,6 +394,15 @@ def _process_match_response(
             ),
         )
     else:
+        if decision == "negotiate":
+            followup_count = _count_purpose(match, "match_followup")
+            if followup_count >= MAX_NEGOTIATION_ROUNDS:
+                match.status = "rejected"
+            else:
+                match.status = match.status or "proposed"
+            db.commit()
+            return
+
         match.status = "rejected"
 
     db.commit()
@@ -389,7 +494,7 @@ def process_agentmail_webhook(payload: dict) -> None:
             return
 
         if purpose == "match_response":
-            if sender.id == proposer.id or recipient.id != proposer.id:
+            if sender.id == proposer.id:
                 logger.warning(
                     "Ignoring response webhook for match %s from sender=%s recipient=%s; proposer=%s",
                     match_id,
@@ -398,6 +503,75 @@ def process_agentmail_webhook(payload: dict) -> None:
                     proposer.id,
                 )
                 return
+
+            decision = str(meta.get("decision", "")).strip().lower()
+            if decision == "negotiate":
+                append_conversation_entry(
+                    match,
+                    _incoming_entry(
+                        sender=sender,
+                        recipient=recipient,
+                        body=body,
+                        subject=subject,
+                        timestamp=timestamp,
+                        meta=meta,
+                        message_id=message_id,
+                        thread_id=thread_id,
+                    ),
+                )
+
+                followup_count = _count_purpose(match, "match_followup")
+                if followup_count >= MAX_NEGOTIATION_ROUNDS:
+                    logger.info("Negotiation limit reached for match %s; ignoring negotiate response.", match_id)
+                    db.commit()
+                    return
+
+                questions = meta.get("questions", [])
+                if not isinstance(questions, list):
+                    questions = []
+
+                synergy_data = build_synergy_data(match)
+                followup_body = compose_followup(match, proposer, other_attendee, questions, synergy_data)
+                followup_meta = {
+                    "match_id": match.id,
+                    "purpose": "match_followup",
+                }
+                followup_subject, followup_full_body = format_agent_email(followup_meta, followup_body)
+                followup_message_id = send_email(
+                    from_inbox_id=proposer.inbox_id,
+                    to_email=other_attendee.agent_email,
+                    subject=followup_subject,
+                    body=followup_full_body,
+                    in_reply_to=message_id,
+                )
+                append_conversation_entry(
+                    match,
+                    _outgoing_entry(
+                        from_email=proposer.agent_email,
+                        to_email=other_attendee.agent_email,
+                        from_name=f"{proposer.name}'s agent",
+                        to_name=f"{other_attendee.name}'s agent",
+                        body=followup_full_body,
+                        subject=followup_subject,
+                        timestamp=datetime.utcnow().isoformat(),
+                        meta=followup_meta,
+                        message_id=followup_message_id,
+                        thread_id=thread_id,
+                    ),
+                )
+                db.commit()
+                return
+
+            if recipient.id != proposer.id:
+                logger.warning(
+                    "Ignoring response webhook for match %s from sender=%s recipient=%s; proposer=%s",
+                    match_id,
+                    sender.id,
+                    recipient.id,
+                    proposer.id,
+                )
+                return
+
             _process_match_response(
                 db,
                 match=match,
@@ -407,6 +581,32 @@ def process_agentmail_webhook(payload: dict) -> None:
                 recipient=recipient,
                 subject=subject,
                 raw_body=body,
+                meta=meta,
+                message_id=message_id,
+                thread_id=thread_id,
+                timestamp=timestamp,
+            )
+            return
+
+        if purpose == "match_followup":
+            if sender.id != proposer.id or recipient.id == proposer.id:
+                logger.warning(
+                    "Ignoring followup webhook for match %s from sender=%s recipient=%s; proposer=%s",
+                    match_id,
+                    sender.id,
+                    recipient.id,
+                    proposer.id,
+                )
+                return
+
+            _process_match_followup(
+                db,
+                match=match,
+                sender=sender,
+                recipient=recipient,
+                subject=subject,
+                raw_body=body,
+                plain_body=parsed["body"],
                 meta=meta,
                 message_id=message_id,
                 thread_id=thread_id,

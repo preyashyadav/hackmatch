@@ -1,4 +1,5 @@
 import re
+import json
 
 
 META_BLOCK_RE = re.compile(
@@ -40,6 +41,17 @@ def parse_agent_email(raw_body: str) -> dict:
             try:
                 meta[key] = float(value)
             except ValueError:
+                meta[key] = value
+            continue
+
+        if key == "questions":
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    meta[key] = parsed
+                else:
+                    meta[key] = value
+            except Exception:
                 meta[key] = value
             continue
 
